@@ -16,10 +16,11 @@ import { resolveProjectPath } from './project-path.js';
 import { ReadableError } from './utils.js';
 
 import type { DeployOptions } from '../types.js';
-import type { FunctionConfig, ParsedIntegrationDefinitions } from './definitions.js';
+import type { FunctionConfig } from './definitions.js';
 import type { ResolvedProjectPath } from './project-path.js';
 import type {
     CLIDeployFlowConfig,
+    FunctionReconciliationScope,
     NangoConfigMetadata,
     NangoYamlParsed,
     OnEventScriptsByProvider,
@@ -33,7 +34,7 @@ import type {
     ScriptFileType
 } from '@nangohq/types';
 
-type LegacyPackage = Pick<PostDeployConfirmation['Body'], 'flowConfigs' | 'onEventScriptsByProvider' | 'deployMode'>;
+type LegacyPackage = Pick<PostDeployConfirmation['Body'], 'flowConfigs' | 'onEventScriptsByProvider' | 'deployMode' | 'reconciliationScope'>;
 type FunctionsBundle = PostFunctionDeploymentBundle['Body'];
 type Deployment = { kind: 'legacy'; package: LegacyPackage } | { kind: 'functions'; bundle: FunctionsBundle };
 type DeploymentPlan = Deployment[];
@@ -74,53 +75,35 @@ export async function deploy({
             console.log(def.error instanceof ReadableError ? def.error.toText() : chalk.red(def.error.message));
             return Err(def.error);
         }
-        if (
-            options.integration &&
-            !def.value.integrations.some((integration) => integration.providerConfigKey === options.integration) &&
-            !def.value.functions.some((config) => config.integrationId === options.integration)
-        ) {
-            spinnerPackage.fail();
-            console.log(chalk.red(`No local definitions found for integration "${options.integration}".`));
-            return Err('no_data');
-        }
+        const reconciliationScope: FunctionReconciliationScope = options.integration
+            ? { kind: 'integration', integrationId: options.integration }
+            : { kind: 'environment' };
+        const isSingleScript = Boolean(options.sync || options.action);
 
-        const deploymentKinds = getDeploymentKinds({
+        const postData = await createLegacyPackage({
             parsed: def.value,
-            optionalIntegrationId: options.integration,
+            fullPath,
+            debug,
+            version,
+            reconciliationScope,
             optionalSyncName: options.sync,
             optionalActionName: options.action
         });
-
-        if (deploymentKinds.includes('legacy')) {
-            const postData = await createLegacyPackage({
-                parsed: def.value,
-                fullPath,
-                debug,
-                version,
-                optionalIntegrationId: options.integration,
-                optionalSyncName: options.sync,
-                optionalActionName: options.action
-            });
-            if (postData.isErr()) {
-                spinnerPackage.fail();
-                console.log(chalk.red(postData.error.message));
-                return Err('no_data');
-            }
-            plan.push({ kind: 'legacy', package: postData.value });
+        if (postData.isErr()) {
+            spinnerPackage.fail();
+            console.log(chalk.red(postData.error.message));
+            return Err('no_data');
         }
-        if (deploymentKinds.includes('functions')) {
-            const bundle = await createFunctionsBundle({ fullPath, functionConfigs: def.value.functions, optionalIntegrationId: options.integration });
+        plan.push({ kind: 'legacy', package: postData.value });
+
+        if (!isSingleScript) {
+            const bundle = await createFunctionsBundle({ fullPath, functionConfigs: def.value.functions, reconciliationScope });
             if (bundle.isErr()) {
                 spinnerPackage.fail();
                 console.log(chalk.red(bundle.error.message));
                 return Err('no_data');
             }
             plan.push({ kind: 'functions', bundle: bundle.value });
-        }
-        if (plan.length === 0) {
-            spinnerPackage.fail();
-            console.log(chalk.red('No functions to deploy.'));
-            return Err('no_data');
         }
 
         spinnerPackage.succeed();
@@ -130,7 +113,7 @@ export async function deploy({
         return Err('failed');
     }
 
-    if (version && plan.some((deployment) => deployment.kind === 'functions')) {
+    if (version && plan.some((deployment) => deployment.kind === 'functions' && deployment.bundle.functions.length > 0)) {
         console.log(chalk.yellow('The --version option only applies to syncs/actions; it has no effect on functions.'));
     }
 
@@ -175,25 +158,19 @@ export async function deploy({
 
     console.log('');
     // Actual deploy
-    const total = plan.reduce(
-        (count, deployment) =>
-            count +
-            (deployment.kind === 'legacy'
-                ? deployment.package.flowConfigs.length + (deployment.package.onEventScriptsByProvider?.reduce((v, t) => v + t.scripts.length, 0) || 0)
-                : deployment.bundle.functions.length),
-        0
-    );
-    const spinnerDeploy = spinnerFactory.start(`Deploying ${total} functions`);
+    const pendingConfirmations = confirmations.filter((confirmation) => !isNoop(confirmation));
+    const total = pendingConfirmations.reduce((count, { deployment }) => count + countFunctions(deployment), 0);
+    const spinnerDeploy = spinnerFactory.start(total > 0 ? `Deploying ${total} functions` : 'Deploying');
     const results: DeploymentResult[] = [];
     // Deployments are intentionally not atomic: completed ones are not rolled back on failure.
-    for (const [failedIndex, confirmation] of confirmations.entries()) {
+    for (const [failedIndex, confirmation] of pendingConfirmations.entries()) {
         const deployRes = await executeDeployment({ confirmation, hostport, debug, nangoYamlBody, sdkVersion, source: deploySource });
         if (deployRes.isErr()) {
             spinnerDeploy.fail();
             printDeploymentMessage(results);
             console.log(chalk.red(deployRes.error.message));
             console.log(chalk.red(failedIndex > 0 ? 'Deployment partially completed.' : 'Deployment failed.'));
-            for (const [index, { kind }] of confirmations.entries()) {
+            for (const [index, { kind }] of pendingConfirmations.entries()) {
                 const status = index < failedIndex ? 'completed' : index === failedIndex ? 'failed' : 'not attempted';
                 console.log(`- ${kind === 'legacy' ? 'Syncs/actions/on-events' : 'Functions'}: ${status}`);
             }
@@ -209,6 +186,25 @@ export async function deploy({
         printDeploymentMessage(results);
     }
     return Ok(true);
+}
+
+function countFunctions(deployment: Deployment): number {
+    if (deployment.kind === 'legacy') {
+        const onEventScriptsCount = deployment.package.onEventScriptsByProvider?.reduce((count, { scripts }) => count + scripts.length, 0) || 0;
+        return deployment.package.flowConfigs.length + onEventScriptsCount;
+    }
+    return deployment.bundle.functions.length;
+}
+
+function isNoop(confirmation: DeploymentConfirmation): boolean {
+    if (countFunctions(confirmation.deployment) > 0) {
+        return false;
+    }
+    if (confirmation.kind === 'legacy') {
+        const { deletedSyncs, deletedActions, deletedOnEventScripts } = confirmation.value;
+        return deletedSyncs.length + deletedActions.length + deletedOnEventScripts.length === 0;
+    }
+    return confirmation.value.deleted.length === 0;
 }
 
 async function previewDeployment({
@@ -266,50 +262,19 @@ async function executeDeployment({
     }
 }
 
-function getDeploymentKinds({
-    parsed,
-    optionalIntegrationId,
-    optionalSyncName,
-    optionalActionName
-}: {
-    parsed: ParsedIntegrationDefinitions;
-    optionalIntegrationId?: string | undefined;
-    optionalSyncName?: string | undefined;
-    optionalActionName?: string | undefined;
-}): Deployment['kind'][] {
-    if (optionalSyncName || optionalActionName) {
-        return ['legacy'];
-    }
-
-    const integrations = optionalIntegrationId
-        ? parsed.integrations.filter((integration) => integration.providerConfigKey === optionalIntegrationId)
-        : parsed.integrations;
-    const hasLegacyScripts = integrations.some(
-        (integration) =>
-            integration.syncs.length > 0 || integration.actions.length > 0 || Object.values(integration.onEventScripts).some((scripts) => scripts.length > 0)
-    );
-    const hasFunctions = parsed.functions.some((config) => !optionalIntegrationId || config.integrationId === optionalIntegrationId);
-
-    const kinds: Deployment['kind'][] = [];
-    if (hasLegacyScripts) {
-        kinds.push('legacy');
-    }
-    if (hasFunctions) {
-        kinds.push('functions');
-    }
-    return kinds;
-}
-
 async function createFunctionsBundle({
     fullPath,
     functionConfigs,
-    optionalIntegrationId
+    reconciliationScope
 }: {
     fullPath: string;
     functionConfigs: FunctionConfig[];
-    optionalIntegrationId?: string | undefined;
+    reconciliationScope: FunctionReconciliationScope;
 }): Promise<Result<FunctionsBundle>> {
-    const selectedConfigs = optionalIntegrationId ? functionConfigs.filter((config) => config.integrationId === optionalIntegrationId) : functionConfigs;
+    const selectedConfigs =
+        reconciliationScope.kind === 'integration'
+            ? functionConfigs.filter((config) => config.integrationId === reconciliationScope.integrationId)
+            : functionConfigs;
 
     const functions: FunctionsBundle['functions'] = [];
     for (const config of selectedConfigs) {
@@ -331,10 +296,7 @@ async function createFunctionsBundle({
         functions.push({ ...artifact, fileBody });
     }
 
-    return Ok({
-        reconciliationScope: optionalIntegrationId ? { kind: 'integration', integrationId: optionalIntegrationId } : { kind: 'environment' },
-        functions
-    });
+    return Ok({ reconciliationScope, functions });
 }
 
 /**
@@ -347,7 +309,7 @@ async function createLegacyPackage({
     fullPath,
     debug,
     version = '',
-    optionalIntegrationId,
+    reconciliationScope,
     optionalSyncName,
     optionalActionName
 }: {
@@ -355,21 +317,22 @@ async function createLegacyPackage({
     fullPath: string;
     debug: boolean;
     version?: string | undefined;
-    optionalIntegrationId?: string | undefined;
+    reconciliationScope: FunctionReconciliationScope;
     optionalSyncName?: string | undefined;
     optionalActionName?: string | undefined;
 }): Promise<Result<LegacyPackage>> {
     printDebug('Packaging', debug);
 
+    const isSingleScript = Boolean(optionalSyncName || optionalActionName);
     const postData: CLIDeployFlowConfig[] = [];
-    const onEventScriptsByProvider: OnEventScriptsByProvider[] | undefined = optionalActionName || optionalSyncName ? undefined : []; // only load on-event scripts if we're not deploying a single sync or action
-    const hasSingleScript = Boolean(optionalSyncName || optionalActionName);
-    const deployMode: 'all' | 'single' | 'integration' = hasSingleScript ? 'single' : optionalIntegrationId ? 'integration' : 'all';
+    const onEventScriptsByProvider: OnEventScriptsByProvider[] | undefined = isSingleScript ? undefined : []; // only load on-event scripts if we're not deploying a single sync or action
+    const integrationId = reconciliationScope.kind === 'integration' ? reconciliationScope.integrationId : undefined;
+    const deployMode: 'all' | 'single' | 'integration' = isSingleScript ? 'single' : integrationId ? 'integration' : 'all';
 
     for (const integration of parsed.integrations) {
         const { providerConfigKey, onEventScripts } = integration;
 
-        if (optionalIntegrationId && integration.providerConfigKey !== optionalIntegrationId) {
+        if (integrationId && integration.providerConfigKey !== integrationId) {
             continue;
         }
 
@@ -473,14 +436,15 @@ async function createLegacyPackage({
         }
     }
 
-    if (postData.length <= 0) {
+    if (isSingleScript && postData.length === 0) {
         return Err(new Error('No syncs or actions to deploy'));
     }
 
     return Ok({
         flowConfigs: postData,
         onEventScriptsByProvider,
-        deployMode
+        deployMode,
+        reconciliationScope: isSingleScript ? undefined : reconciliationScope
     });
 }
 
